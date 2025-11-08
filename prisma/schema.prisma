@@ -1,0 +1,208 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============ IDENTITY LAYER ============
+/// Telegram user integrations
+model TgUser {
+  id        Int      @id
+  username  String?  @unique
+  firstName String?
+  lastName  String?
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  appUser AppUser?
+
+  @@map("tg_users")
+}
+
+/// Application user identity (separates from Telegram for future multi-channel support)
+model AppUser {
+  id                String   @id @default(uuid())
+  tgUserId          Int?     @unique // Can be null for future multi-channel (web, email, etc)
+  email             String?  @unique
+  displayName       String?
+  identityVerifiedAt DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  metadata          Json     @default("{}")
+
+  tgUser       TgUser?        @relation(fields: [tgUserId], references: [id], onDelete: SetNull)
+  medicalCards MedicalCard[]
+  sessions     Session[]
+  cardEvents   CardEvent[]
+  consents     Consent[]
+  attachments  Attachment[]
+  exports      CardExport[]
+
+  @@map("app_users")
+}
+
+// ============ MEDICAL DATA LAYER ============
+/// Medical card - contains all patient medical information
+model MedicalCard {
+  id                String   @id @default(uuid())
+  userId            String
+  status            String   @default("in_progress") // in_progress, completed, submitted, archived
+  completionPercent Int      @default(0)
+  demographics      Json?    // Personal details: name, DOB, sex, contact info
+  chiefComplaint    Json?    // Chief complaint: complaint, pain type, duration, etc
+  medicalHistory    Json?    // Medical history: chronic diseases, medications, allergies, etc
+  assessment        Json?    // Assessment: diagnosis, red flags, likely causes, next steps
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  deletedAt         DateTime? // Soft delete for compliance
+
+  user        AppUser      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events      CardEvent[]
+  session     Session?
+  attachments Attachment[]
+  exports     CardExport[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("medical_cards")
+}
+
+// ============ EVENT SOURCING ============
+/// Domain events - immutable audit trail of all card changes (source of truth)
+model CardEvent {
+  id             String   @id @default(uuid())
+  cardId         String
+  userId         String   // Who triggered the event
+  eventType      String   // card_created, step_completed, data_updated, card_submitted, consent_given, etc
+  stepNumber     Int?     // Which step (for step_completed events)
+  changedFields  Json?    // {fieldName: string, oldValue: any, newValue: any}[]
+  payload        Json?    // Full context of the event
+  source         String   @default("telegram_bot") // telegram_bot, web_api, admin_panel, system
+  idempotencyKey String   @unique @default(uuid()) // Prevent duplicate events
+  createdAt      DateTime @default(now()) // Immutable timestamp
+
+  card MedicalCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  user AppUser     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([cardId])
+  @@index([userId])
+  @@index([eventType])
+  @@index([createdAt])
+  @@map("card_events")
+}
+
+// ============ COMPLIANCE & CONSENT ============
+/// User consents for data processing, medical data use, exports, etc
+model Consent {
+  id          String   @id @default(uuid())
+  userId      String
+  type        String   // data_processing, medical_data, export_to_doctor, sharing_with_provider
+  version     Int      @default(1) // Track consent version changes
+  givenAt     DateTime
+  expiresAt   DateTime?
+  withdrawnAt DateTime?
+  metadata    Json?    // ip_address, user_agent, timestamp_precise
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([type])
+  @@map("consents")
+}
+
+/// File attachments - scans, photos, lab results, etc
+model Attachment {
+  id           String   @id @default(uuid())
+  cardId       String
+  userId       String   // Who uploaded it
+  fileType     String   // scan, photo, document, lab_result, imaging
+  mimeType     String   // image/jpeg, application/pdf, etc
+  storagePath  String   // Reference to S3/GCS (not the actual file stored here)
+  fileHash     String   @unique // SHA256 for dedup & integrity verification
+  sizeBytes    BigInt
+  uploadedBy   String   // User ID who uploaded
+  createdAt    DateTime @default(now())
+  metadata     Json?    // original_filename, processing_status, virus_scan_status
+
+  card MedicalCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  user AppUser     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([cardId])
+  @@index([userId])
+  @@map("attachments")
+}
+
+/// Export records - track all exports for compliance
+model CardExport {
+  id            String   @id @default(uuid())
+  cardId        String
+  userId        String   // Who requested export
+  format        String   // excel, pdf, json, hl7
+  recipientType String   // user_download, doctor_email, archive, fax
+  recipientEmail String?
+  status        String   @default("pending") // pending, generated, sent, failed
+  storagePath   String?  // Where export file is stored
+  createdAt     DateTime @default(now())
+  completedAt   DateTime?
+  metadata      Json?    // error_msg if failed, email_sent_at, download_count, etc
+
+  card MedicalCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  user AppUser     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([cardId])
+  @@index([userId])
+  @@index([status])
+  @@map("card_exports")
+}
+
+// ============ EPHEMERAL STATE ============
+/// Session state - current user step and form data (TTL: 48 hours)
+model Session {
+  id              String   @id @default(uuid())
+  userId          String
+  cardId          String   @unique
+  step            Int      // Current step (0, 1, 1.1, 1.2, 2, 2.1, 2.2, 2.3, 3, 4, etc)
+  answers         Json     @default("{}")  // Form answers: {field: value, ...}
+  stateData       Json     @default("{}")  // UI state: checkboxAnswers, generatedQuestions, etc
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  expiresAt       DateTime // Auto-cleanup after this time
+  lastActivityAt  DateTime @default(now())
+
+  user AppUser     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  card MedicalCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt]) // For cleanup job
+  @@map("sessions")
+}
+
+// ============ SYSTEM LAYER ============
+/// System audit log - infrastructure actions, migrations, admin actions (NOT domain events)
+model AuditLog {
+  id           String   @id @default(uuid())
+  actorType    String   // system, admin, bot, api_key, scheduled_job
+  actorId      String?  // user_id or api_key_id or job_name
+  action       String   // db_migration, backup, cleanup, admin_delete, admin_restore, etc
+  resourceType String?  // card, user, export, consent, session
+  resourceId   String?
+  status       String   // success, failed
+  details      Json?    // error_msg, duration_ms, affected_rows, etc
+  createdAt    DateTime @default(now())
+  metadata     Json?    // ip_address, user_agent, endpoint
+
+  @@index([actorType])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
