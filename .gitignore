@@ -5,7 +5,8 @@ node_modules
 /src/generated/prisma
 
 *.xlsx
-
+.claude/
+nul
 # dependencies
 node_modules/
 
